@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "rootDir": "./scripts",
+    "rootDir": ".",
     "module": "nodenext",
     "target": "es2024",
     "types": ["node"],
@@ -13,5 +13,5 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts"]
 }

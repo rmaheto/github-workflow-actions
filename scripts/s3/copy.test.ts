@@ -12,7 +12,13 @@ import {
   S3Client,
   UploadPartCopyCommand,
 } from '@aws-sdk/client-s3';
-import { copyObjects, readInputs } from './copy.ts';
+import { createLogger } from '../../src/shared/logging/logger.ts';
+import { classifyFailure, copyObjects as transfer, readInputs, wasLogged } from './copy.ts';
+import type { CopyOptions } from './copy.ts';
+
+const silent = createLogger('test', { level: 'ERROR', stdout: () => {}, stderr: () => {} });
+const copyObjects = (client: Parameters<typeof transfer>[0], inputs: Parameters<typeof transfer>[1], options: CopyOptions = {}) =>
+  transfer(client, inputs, { logger: silent, ...options });
 
 type CopyCommand = AbortMultipartUploadCommand | CompleteMultipartUploadCommand
   | CopyObjectCommand | CreateMultipartUploadCommand | GetObjectTaggingCommand
@@ -90,7 +96,8 @@ test('recursive copy paginates and preserves relative paths', async () => {
   const copied = await copyObjects(client, readInputs({
     ...env, RECURSIVE: 'true', SOURCE_KEY: 'reports/', DESTINATION_KEY: 'archive',
   }));
-  assert.equal(copied, 2);
+  assert.equal(copied.objectsCopied, 2);
+  assert.equal(copied.bytesCopied, 24);
   assert.deepEqual(client.calls.filter((c) => c instanceof CopyObjectCommand)
     .map((c) => c.input.Key), ['archive/a.csv', 'archive/nested/b.csv']);
 });
@@ -104,9 +111,9 @@ test('whole-bucket copies and empty listings', async () => {
       }
       return command instanceof HeadObjectCommand ? { ContentLength: 12, ETag: '"source"' } : {};
     });
-    assert.equal(await copyObjects(client, readInputs({
+    assert.equal((await copyObjects(client, readInputs({
       ...env, RECURSIVE: 'true', SOURCE_KEY: '', DESTINATION_KEY: '',
-    })), contents.length);
+    }))).objectsCopied, contents.length);
     if (contents.length) {
       const command = client.calls.at(-1);
       assert.ok(command instanceof CopyObjectCommand);
@@ -175,4 +182,130 @@ test('AWS failures and malformed pagination are not converted to success', async
     (error) => error === failure);
   await assert.rejects(copyObjects(mockClient(() => ({ IsTruncated: true })),
     readInputs({ ...env, RECURSIVE: 'true' })), /continuation token/);
+});
+
+function capture(level: 'DEBUG' | 'INFO' = 'INFO') {
+  const lines: string[] = [];
+  const logger = createLogger('s3-copy', { level, stdout: (l) => lines.push(l), stderr: (l) => lines.push(l) });
+  const entries = () => lines.map((l) => JSON.parse(l) as { level: string; message: string; context?: Record<string, unknown> });
+  return { logger, lines, entries };
+}
+
+const awsError = (name: string, status: number, requestId: string) =>
+  Object.assign(new Error(`${name} for AKIAABCDEFGHIJKLMNOP`), { name, $metadata: { httpStatusCode: status, requestId } });
+
+test('logs initialization, success and totals without object keys at INFO', async () => {
+  const { logger, lines, entries } = capture();
+  const client = mockClient((c) => c instanceof HeadObjectCommand ? { ContentLength: 12, ETag: '"e"' } : {});
+  const result = await copyObjects(client, readInputs(env), { logger });
+  assert.equal(result.bytesCopied, 12);
+  const [start, ...rest] = entries();
+  assert.equal(start?.message, 'Transfer started');
+  assert.equal(start?.context?.sourceBucket, 'example-source');
+  assert.equal(start?.context?.destinationBucket, 'example-destination');
+  assert.equal(start?.context?.mode, 'single-object');
+  assert.ok(typeof start?.context?.startedAt === 'string');
+  const done = rest.at(-1);
+  assert.equal(done?.message, 'Transfer completed');
+  assert.deepEqual([done?.context?.status, done?.context?.objectsCopied, done?.context?.bytesCopied],
+    ['success', 1, 12]);
+  assert.ok(typeof done?.context?.durationMs === 'number');
+  assert.ok(rest.some((e) => e.message === 'Source object validated' && e.context?.sizeBytes === 12));
+  assert.ok(!lines.join('\n').includes('monthly.csv'));
+});
+
+test('object keys appear only at DEBUG', async () => {
+  const { logger, lines } = capture('DEBUG');
+  const client = mockClient((c) => c instanceof HeadObjectCommand ? { ContentLength: 1, ETag: '"e"' } : {});
+  await copyObjects(client, readInputs(env), { logger });
+  assert.ok(lines.join('\n').includes('reports/monthly.csv'));
+});
+
+test('recursive transfers log listing progress and a summary', async () => {
+  const { logger, entries } = capture();
+  const client = mockClient((c) => {
+    if (c instanceof ListObjectsV2Command) return { Contents: [{ Key: 'p/a' }, { Key: 'p/b' }] };
+    return c instanceof HeadObjectCommand ? { ContentLength: 5, ETag: '"e"' } : {};
+  });
+  await copyObjects(client, readInputs({ ...env, RECURSIVE: 'true', SOURCE_KEY: 'p/' }), { logger });
+  const all = entries();
+  assert.ok(all.some((e) => e.message === 'Listing page received' && e.context?.objectsInPage === 2));
+  assert.equal(all.at(-1)?.context?.objectsCopied, 2);
+  assert.equal(all.at(-1)?.context?.bytesCopied, 10);
+  assert.equal(all.at(-1)?.context?.mode, 'recursive');
+});
+
+test('missing source is reported once with AWS metadata and the original error is rethrown', async () => {
+  const { logger, entries, lines } = capture();
+  const failure = awsError('NotFound', 404, 'REQ123');
+  const progress = { objectsCopied: 0, bytesCopied: 0 };
+  await assert.rejects(
+    copyObjects(mockClient(() => { throw failure; }), readInputs(env), { logger, progress }),
+    (error) => error === failure,
+  );
+  const errors = entries().filter((e) => e.level === 'ERROR');
+  assert.equal(errors.length, 1);
+  assert.deepEqual(
+    [errors[0]?.context?.errorCategory, errors[0]?.context?.operation, errors[0]?.context?.httpStatusCode, errors[0]?.context?.requestId],
+    ['SourceNotFound', 'HeadObject', 404, 'REQ123'],
+  );
+  assert.match(String(errors[0]?.context?.errorMessage), /Source object not found or inaccessible/);
+  assert.ok(wasLogged(failure));
+  assert.ok(!lines.join('\n').includes('AKIAABCDEFGHIJKLMNOP'));
+});
+
+test('a 404 from CopyObject is a copy failure, not a missing source', async () => {
+  const { logger, entries } = capture();
+  const failure = awsError('NoSuchBucket', 404, 'REQ9');
+  const client = mockClient((c) => {
+    if (c instanceof HeadObjectCommand) return { ContentLength: 1, ETag: '"e"' };
+    throw failure;
+  });
+  await assert.rejects(copyObjects(client, readInputs(env), { logger }));
+  const error = entries().find((e) => e.level === 'ERROR');
+  assert.equal(error?.context?.errorCategory, 'CopyFailed');
+  assert.equal(error?.context?.operation, 'CopyObject');
+  assert.equal(classifyFailure('ListObjectsV2', failure), 'SourceListFailed');
+});
+
+test('multipart copy logs progress and abort failures', async () => {
+  const { logger, entries } = capture('DEBUG');
+  const size = 5 * 1024 ** 3 + 1;
+  const ok = mockClient((c) => {
+    if (c instanceof HeadObjectCommand) return { ContentLength: size, ETag: '"e"' };
+    if (c instanceof CreateMultipartUploadCommand) return { UploadId: 'up' };
+    if (c instanceof UploadPartCopyCommand) return { CopyPartResult: { ETag: '"p"' } };
+    return {};
+  });
+  const result = await copyObjects(ok, readInputs(env), { logger });
+  assert.equal(result.bytesCopied, size);
+  const messages = entries().map((e) => e.message);
+  assert.ok(messages.includes('Multipart upload initiated'));
+  assert.equal(messages.filter((m) => m === 'Multipart part copied').length, 11);
+  assert.ok(messages.includes('Multipart upload completed'));
+
+  const second = capture();
+  const failure = awsError('AccessDenied', 403, 'R1');
+  const failing = mockClient((c) => {
+    if (c instanceof HeadObjectCommand) return { ContentLength: size, ETag: '"e"' };
+    if (c instanceof CreateMultipartUploadCommand) return { UploadId: 'up' };
+    if (c instanceof GetObjectTaggingCommand) return { TagSet: [] };
+    if (c instanceof AbortMultipartUploadCommand) throw awsError('InternalError', 500, 'R2');
+    throw failure;
+  });
+  await assert.rejects(copyObjects(failing, readInputs(env), { logger: second.logger }), (e) => e === failure);
+  const abort = second.entries().find((e) => e.message === 'Failed to abort multipart upload');
+  assert.equal(abort?.context?.requestId, 'R2');
+  assert.equal(second.entries().filter((e) => e.message === 'S3 transfer failed').length, 1);
+});
+
+test('logs never contain credentials found in error details', async () => {
+  const { logger, lines } = capture('DEBUG');
+  const failure = Object.assign(new Error('denied Bearer abc.def token=1'), {
+    name: 'AccessDenied', $metadata: { httpStatusCode: 403 }, authorization: 'secret-value',
+  });
+  await assert.rejects(copyObjects(mockClient(() => { throw failure; }), readInputs(env), { logger }));
+  const output = lines.join('\n');
+  assert.ok(!output.includes('abc.def'));
+  assert.ok(!output.includes('secret-value'));
 });

@@ -7,6 +7,8 @@ An example manually triggered [pipeline](.github/workflows/pipeline.yml) that ca
 - [pipeline.yml](.github/workflows/pipeline.yml): manual trigger, user inputs, runner, checkout, and job permissions. Passes the role secret to the local copy action.
 - [.github/actions/copy-s3/action.yml](.github/actions/copy-s3/action.yml): operation steps for Node.js setup, dependency installation, strict type-checking, input validation, OIDC authentication, and script execution.
 - [scripts/s3/copy.ts](scripts/s3/copy.ts): external TypeScript containing input validation and AWS SDK copy logic. `--validate-only` checks inputs without calling AWS; the normal invocation validates again before copying. It reads `SOURCE_BUCKET`, `DESTINATION_BUCKET`, `SOURCE_KEY`, `DESTINATION_KEY`, and `RECURSIVE` from environment variables.
+- [src/shared/logging/logger.ts](src/shared/logging/logger.ts): reusable structured JSON logger (`createLogger('component')`), independent of AWS and GitHub Actions.
+- [src/shared/reporting/job-summary.ts](src/shared/reporting/job-summary.ts): writes a GitHub job summary to `GITHUB_STEP_SUMMARY`; does nothing when that variable is unset.
 - [scripts/s3/copy.test.ts](scripts/s3/copy.test.ts): tests with mocked SDK calls; no AWS credentials or buckets required.
 - [package.json](package.json) and [package-lock.json](package-lock.json): SDK dependency and reproducible installation.
 - [tsconfig.json](tsconfig.json): strict checking with erasable TypeScript syntax. Node.js 24 runs scripts directly; `npm run build` checks types without generating output. Sources stay under `scripts/` to retain the operation directory layout.
@@ -225,6 +227,17 @@ npm test
 Tests mock AWS calls: no AWS credentials, bucket access, or AWS charges are required.
 
 Node.js and npm dependencies still require security updates; TypeScript does not eliminate dependency vulnerabilities. The lockfile makes installs reproducible, not automatically safe. Review dependency updates and run `npm audit` alongside tests; an audit only detects known advisories and is not a security guarantee.
+
+## Logging and job summary
+
+Each log entry is one JSON line with `timestamp` (ISO 8601), `level`, `component`, `message`, and optional `context`. DEBUG and INFO go to stdout; WARN and ERROR go to stderr. Set `LOG_LEVEL` to `DEBUG`, `INFO` (default), `WARN`, or `ERROR`.
+
+- Object keys are logged only at `DEBUG`, since file names may be sensitive. Use it only when needed.
+- Fields such as passwords, secrets, tokens, authorization headers, credentials, access keys, and object bodies are redacted by key name (case-insensitive, nested); AWS access key IDs, GitHub tokens, and `Bearer`/`Basic` values are also redacted in text. Circular references and serialization failures never break the transfer.
+- Failures log the category (`SourceNotFound`, `SourceLookupFailed`, `SourceListFailed`, `CopyFailed`), operation, AWS HTTP status, and request ID. Only a failed `HeadObject` on the source is reported as a missing source.
+- The job summary shows status, buckets, mode, objects and bytes copied, and duration. Encryption is not verified by this job, and the summary says so.
+
+No new AWS permissions are required.
 
 ## Run a copy locally
 
