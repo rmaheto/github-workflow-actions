@@ -1,0 +1,53 @@
+name: S3 pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_bucket:
+        description: Source bucket name (without s3://)
+        required: true
+        type: string
+      destination_bucket:
+        description: Destination bucket name (without s3://)
+        required: true
+        type: string
+      recursive:
+        description: Copy all objects under the source prefix (unchecked copies one object)
+        required: true
+        default: false
+        type: boolean
+      source_key:
+        description: Object key, or prefix when recursive (empty prefix copies the entire bucket)
+        required: false
+        type: string
+      destination_key:
+        description: Destination key or prefix (empty uses bucket root; end a prefix with /)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  copy:
+    if: startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out pipeline implementation
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Copy S3 objects
+        uses: ./.github/actions/copy-s3
+        with:
+          source_bucket: ${{ inputs.source_bucket }}
+          destination_bucket: ${{ inputs.destination_bucket }}
+          recursive: ${{ inputs.recursive }}
+          source_key: ${{ inputs.source_key }}
+          destination_key: ${{ inputs.destination_key }}
+          role_arn: ${{ secrets.AWS_ROLE_ARN }}

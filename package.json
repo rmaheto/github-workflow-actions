@@ -1,0 +1,19 @@
+{
+  "name": "github-workflow-actions-s3",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "node --test scripts/s3/copy.test.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1169.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2"
+  }
+}
