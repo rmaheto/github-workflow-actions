@@ -3,6 +3,11 @@ name: S3 pipeline
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: Target environment (prod requires approval)
+        required: true
+        type: choice
+        options: [dev, test, prod]
       source_bucket:
         description: Source bucket name (without s3://)
         required: true
@@ -29,10 +34,68 @@ permissions:
   contents: read
 
 jobs:
+  # Stand-in for Remedy: emails a signed approval link. Prod only.
+  request-approval:
+    if: startsWith(github.ref, 'refs/heads/') && inputs.environment == 'prod'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      crq_id: ${{ steps.crq.outputs.crq_id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # needs lambda:InvokeFunction on the approver
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Create CRQ and send approval email
+        id: crq
+        env:
+          # Inputs go through env, not inline ${{ }}, so typed values can't inject shell
+          APPROVER_LAMBDA: ${{ vars.APPROVER_LAMBDA }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CRQ_ID: CRQ-SIM-${{ github.run_id }}
+          SRC_BUCKET: ${{ inputs.source_bucket }}
+          SRC_KEY: ${{ inputs.source_key }}
+          DST_BUCKET: ${{ inputs.destination_bucket }}
+          DST_KEY: ${{ inputs.destination_key }}
+          RECURSIVE: ${{ inputs.recursive }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "crq_id=$CRQ_ID" >> "$GITHUB_OUTPUT"
+
+          MODE=$([ "$RECURSIVE" = "true" ] && echo "recursive" || echo "single object")
+          SUMMARY="Prod S3 copy ($MODE) by $ACTOR: s3://$SRC_BUCKET/$SRC_KEY -> s3://$DST_BUCKET/$DST_KEY"
+
+          jq -n --arg run_url "$RUN_URL" --arg crq "$CRQ_ID" --arg summary "$SUMMARY" \
+            '{mode:"notify", run_url:$run_url, crq_id:$crq, summary:$summary}' > payload.json
+
+          aws lambda invoke \
+            --function-name "$APPROVER_LAMBDA" \
+            --cli-binary-format raw-in-base64-out \
+            --payload file://payload.json out.json
+          cat out.json
+          if jq -e 'has("errorMessage")' out.json >/dev/null; then exit 1; fi
+
+          {
+            echo "### Change request \`$CRQ_ID\` created"
+            echo "$SUMMARY"
+            echo ""
+            echo "Approval email sent. The \`copy\` job will wait for approval."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   copy:
-    if: startsWith(github.ref, 'refs/heads/')
+    needs: request-approval
+    # Run when approval request succeeded (prod) or was skipped (dev/test)
+    if: ${{ !failure() && !cancelled() && startsWith(github.ref, 'refs/heads/') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # 'prod' has a required reviewer, so this job pauses until the Lambda approves it.
+    # dev/test have no protection rules and start immediately.
+    environment: ${{ inputs.environment }}
     permissions:
       contents: read
       id-token: write
